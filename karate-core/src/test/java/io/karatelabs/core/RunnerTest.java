@@ -395,6 +395,34 @@ class RunnerTest {
     }
 
     @Test
+    void testRunnerWithLineNumberFilterIgnoresFeatureLevelTag() throws Exception {
+        // Create a feature with @ignore tag on the Feature line itself
+        Path feature = tempDir.resolve("ignore-feature.feature");
+        Files.writeString(feature, """
+            @ignore
+            Feature: Ignored feature
+
+            Scenario: first
+            * print 'first'
+
+            Scenario: second
+            * def a = 1
+            * match a == 1
+            """);
+
+        // Run the second scenario by line number - should bypass the feature-level @ignore
+        SuiteResult result = Runner.path(feature.toString() + ":7")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(1, result.getFeatureCount());
+        assertEquals(1, result.getScenarioPassedCount());
+    }
+
+    @Test
     void testRunnerWithLineNumberFilterScenarioOutline() throws Exception {
         // Create a feature with Scenario Outline
         Path feature = tempDir.resolve("outline.feature");
@@ -642,6 +670,39 @@ class RunnerTest {
 
         assertTrue(result.isPassed());
         assertEquals(3, result.getScenarioPassedCount());
+    }
+
+    @Test
+    void testRunnerWithScenarioNameFilterFeatureLevelIgnore() throws Exception {
+        Files.writeString(tempDir.resolve("a.feature"), """
+            Feature: A
+            Scenario: Shared
+            * def x = 1
+            """);
+        Files.writeString(tempDir.resolve("b.feature"), """
+            @ignore
+            Feature: B
+            Scenario: Shared
+            * def x = 2
+            """);
+        // a feature-level @ignore helper with no matching scenario stays out of the results
+        Files.writeString(tempDir.resolve("helper.feature"), """
+            @ignore
+            Feature: Helper
+            Scenario: Helper
+            * def y = 1
+            """);
+
+        SuiteResult result = Runner.path(tempDir.toString())
+                .scenarioName("Shared")
+                .workingDir(tempDir)
+                .outputDir(tempDir.resolve("reports"))
+                .outputConsoleSummary(false)
+                .parallel(1);
+
+        assertTrue(result.isPassed());
+        assertEquals(2, result.getFeatureCount());
+        assertEquals(2, result.getScenarioPassedCount());
     }
 
     @Test

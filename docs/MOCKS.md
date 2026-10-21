@@ -459,6 +459,10 @@ var server = karate.start({ mock: 'api.feature', port: 8443, ssl: true });
 var port = server.port;
 var url = server.url;
 
+// Read mock state (optional default, like karate.get): a deep copy taken under the request lock (MockHandler.getVariableSnapshot),
+// so it is consistent, unaffected by later requests, and cannot mutate the mock
+var items = server.get('items');
+
 // Stop when done
 server.stop();
 ```

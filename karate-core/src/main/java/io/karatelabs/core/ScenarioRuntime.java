@@ -108,9 +108,9 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
     // Channels (kafka, grpc, etc.) registered during this scenario
     private List<Channel> channels;
 
-    // Performance testing - tracks the previous HTTP request's perf event
-    // Events are held until the next HTTP request or scenario end, so that
-    // assertion failures can be attributed to the preceding HTTP request
+    // Performance testing - tracks the previous perf event (HTTP or custom)
+    // Events are held until the next perf event or scenario end, so that
+    // assertion failures can be attributed to the preceding request
     private PerfEvent prevPerfEvent;
     private boolean driverFromProvider;  // true if driver came from provider (use release, not quit)
     private boolean driverInherited;     // true if driver was inherited from caller (don't close)
@@ -377,13 +377,14 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
         return configVars;
     }
 
-    /** Snapshot of the caller-scope variables seeded into this (isolated-scope) called scenario by
-     *  {@link #inheritVariables()} — key to the seeded value (a shallow copy). A called feature runs
+    /** Snapshot of the caller-scope variables seeded into this called scenario by
+     *  {@link #inheritVariables()} — key to the seeded value (a shallow copy in isolated scope, the
+     *  caller's own reference in shared scope). A called feature runs
      *  with the caller's visible variables in scope so it can read them, but those inherited entries
      *  must not echo back in the {@code call}/{@code callonce} result. The result is the callee's delta
      *  (see {@link StepUtils#calleeDelta}); an untouched inherited binding still holds this exact value
      *  (identity), while a callee {@code def}/assign replaces it, so the delta keeps only what the
-     *  called feature actually contributed. Empty for shared-scope and top-level scenarios. */
+     *  called feature actually contributed. Empty for top-level scenarios. */
     private final Map<String, Object> inheritedVariables = new java.util.LinkedHashMap<>();
 
     public Map<String, Object> getInheritedVariables() {
@@ -996,9 +997,9 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
                 if (!sharedScope) {
                     // Isolated scope - shallow copy maps and lists so mutations don't affect parent
                     value = shallowCopy(value);
-                    // Remember what we seeded so the call result can exclude inherited scope
-                    inheritedVariables.put(entry.getKey(), value);
                 }
+                // Remember what we seeded so the call result can exclude inherited scope
+                inheritedVariables.put(entry.getKey(), value);
                 karate.engine.put(entry.getKey(), value);
             }
             // Inherit cookie jar from caller so called feature shares session cookies
@@ -1019,8 +1020,8 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
                 Object value = entry.getValue();
                 if (!sharedScope) {
                     value = shallowCopy(value);
-                    inheritedVariables.put(entry.getKey(), value);
                 }
+                inheritedVariables.put(entry.getKey(), value);
                 karate.engine.put(entry.getKey(), value);
             }
             inheritCookieJarFromCaller(lastExecuted);
@@ -1365,23 +1366,7 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
             // Report (and drain) the last held perf event before teardown so Gatling receives
             // all HTTP metrics. The deferred model attaches a scenario failure to the last HTTP
             // request; logLastPerfEvent reports whether it actually did.
-            String perfFailureMessage = null;
-            if (result.isFailed()) {
-                // file:line + step text + the reason's first line — the KO message names both
-                // *where* and *why*, matching the failure log. Deliberately not the full match
-                // diff: Gatling groups its errors table by this string.
-                String display = result.getPerfFailureMessage();
-                perfFailureMessage = display != null ? display : "scenario failed";
-            }
-            boolean perfFailureReported = logLastPerfEvent(perfFailureMessage);
-            // If the scenario failed but no HTTP perf event carried the failure — it failed
-            // before its first request, or via a non-HTTP step — synthesize one so the failure
-            // still surfaces as a Gatling KO instead of vanishing. Top-level only: a called
-            // feature's failure propagates to its caller, which reports it (avoids double KOs).
-            if (perfFailureMessage != null && !perfFailureReported
-                    && isPerfMode() && featureRuntime != null && featureRuntime.isTopLevel()) {
-                reportSyntheticFailurePerfEvent(perfFailureMessage);
-            }
+            reportPerfFailure(perfFailureMessage());
 
             // Invoke afterScenario hook - runs on both pass and fail paths so teardown always executes.
             // Must run BEFORE closeChannels/closeDriver: the hook still owns the scenario's
@@ -1400,6 +1385,8 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
                     // Bump end time since we added a post-scenario step
                     result.setEndTime(System.currentTimeMillis());
                 }
+                // the drain above already ran, so a perf event the hook captured would stay held
+                reportPerfFailure(hookError != null ? perfFailureMessage() : null);
             }
 
             // Close channels (kafka, grpc, etc.)
@@ -1589,12 +1576,64 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
             // fallback: estimate as 2 lines after the step keyword (step line + """)
             lineOffset = step.getLine(); // 1-indexed, but +1 for """ line makes it 0-indexed equivalent
         }
-        io.karatelabs.common.Resource embedded = io.karatelabs.common.Resource.embedded(expression, featureResource, lineOffset);
+        String text = alignToSourceLines(expression, featureResource, step.getDocStringLine());
+        io.karatelabs.common.Resource embedded = io.karatelabs.common.Resource.embedded(text, featureResource, lineOffset);
         return karate.engine.eval(embedded);
+    }
+
+    /**
+     * The parser drops empty lines from a docstring, so every JS line after one would be reported
+     * a line too high. Put them back, as empty lines, where the feature file has them. Each
+     * non-empty line of the source matches one line of {@code text}, which must therefore have as
+     * many lines as the docstring (it may carry a prefix or suffix, like the JSON-like wrapping
+     * parens); otherwise {@code text} is returned as is.
+     */
+    static String alignToSourceLines(String text, io.karatelabs.common.Resource featureResource, int firstLine) {
+        if (firstLine < 0 || text.indexOf('\n') < 0) {
+            return text;
+        }
+        String source;
+        try {
+            source = featureResource.getText();
+        } catch (Exception e) {
+            return text;
+        }
+        if (source == null) {
+            return text;
+        }
+        String[] sourceLines = source.replace("\r", "").split("\n", -1);
+        String[] lines = text.split("\n", -1);
+        if (firstLine >= sourceLines.length) {
+            return text;
+        }
+        StringBuilder sb = new StringBuilder(text.length() + 16);
+        int next = 0;
+        boolean blankAdded = false;
+        for (int i = firstLine; i < sourceLines.length && next < lines.length; i++) {
+            if (sourceLines[i].isEmpty()) {
+                sb.append('\n');
+                blankAdded = true;
+            } else {
+                sb.append(lines[next++]);
+                if (next < lines.length) {
+                    sb.append('\n');
+                }
+            }
+        }
+        if (next < lines.length) {
+            return text; // the source ran out first: not the text this docstring was parsed into
+        }
+        return blankAdded ? sb.toString() : text;
     }
 
     public void setVariable(String name, Object value) {
         assignedVariables.add(name);
+        karate.engine.put(name, value);
+    }
+
+    /** Bind without recording the name in {@link #assignedVariables} - for re-binding scope a
+     *  shared-scope callee merely inherited. */
+    public void putUnclaimedVariable(String name, Object value) {
         karate.engine.put(name, value);
     }
 
@@ -2318,6 +2357,12 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
         // Determine driver type and parse scope
         String driverType = (String) configMap.getOrDefault("type", "chrome");
         boolean isW3c = io.karatelabs.driver.w3c.W3cBrowserType.isW3cType(driverType);
+        // a custom provider (including a PooledDriverProvider subclass) owns its type vocabulary
+        boolean builtInDispatch = provider == null
+                || provider.getClass() == io.karatelabs.driver.PooledDriverProvider.class;
+        if (builtInDispatch && !isW3c && !"chrome".equals(driverType)) {
+            throw new RuntimeException(unsupportedDriverTypeMessage(driverType));
+        }
 
         if (isW3c) {
             io.karatelabs.driver.w3c.W3cDriverOptions w3cOptions = io.karatelabs.driver.w3c.W3cDriverOptions.fromMap(configMap);
@@ -2357,6 +2402,18 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
         DriverApi.bindJsHelpers(karate.engine, driver);
 
         return driver;
+    }
+
+    static String unsupportedDriverTypeMessage(String type) {
+        StringBuilder sb = new StringBuilder("unsupported driver type: '").append(type).append("'");
+        if ("android".equals(type) || "ios".equals(type) || "winappdriver".equals(type)) {
+            sb.append(" - native app automation (Appium / WinAppDriver) is not supported in Karate v2");
+        }
+        sb.append(", supported types: chrome");
+        for (io.karatelabs.driver.w3c.W3cBrowserType bt : io.karatelabs.driver.w3c.W3cBrowserType.values()) {
+            sb.append(", ").append(bt.getKarateType());
+        }
+        return sb.toString();
     }
 
     /**
@@ -2509,8 +2566,9 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
         // via the normal inheritDriverFromCaller path. Without this, scenario N+1 in a
         // multi-scenario called feature can't see scenario N's driver — it falls
         // through to PooledDriverProvider.acquire() and deadlocks if the pool is full.
+        // A driver quit here is not propagated, so it falls through to release.
         if (featureRuntime != null && featureRuntime.isSharedScope()
-                && featureRuntime.getCallerScenario() != null) {
+                && featureRuntime.getCallerScenario() != null && !driver.isTerminated()) {
             featureRuntime.getCallerScenario().setDriverFromCallee(this);
             driver = null;
             return;
@@ -2576,6 +2634,9 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
      */
     public void setDriverFromCallee(ScenarioRuntime callee) {
         if (callee.driver != null && !callee.driver.isTerminated()) {
+            if (driver != null && driver != callee.driver && driver.isTerminated()) {
+                closeDriver();
+            }
             this.driver = callee.driver;
             this.driverFromProvider = callee.driverFromProvider;
             this.driverInherited = false; // This scenario now owns the driver
@@ -2657,11 +2718,11 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
     }
 
     /**
-     * Capture a performance event for the HTTP request just completed.
+     * Capture a performance event for the HTTP request (or custom operation) just completed.
      * <p>
      * This implements the "deferred reporting" pattern from v1:
      * - The previous event is reported first (if any)
-     * - The new event is held until the next HTTP request or scenario end
+     * - The new event is held until the next perf event or scenario end
      * - This allows assertion failures to be attributed to the preceding HTTP request
      *
      * @param event the performance event to capture
@@ -2684,7 +2745,7 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
      *
      * @param failureMessage the failure message (null if successful)
      * @return true if a <em>failed</em> event was reported — i.e. the failure was carried by a
-     *         real HTTP perf event. False if there was no held event or it was reported as OK.
+     *         real (HTTP or custom) perf event. False if there was no held event or it was reported as OK.
      *         The caller uses this to decide whether a scenario failure still needs a synthetic
      *         perf event (a failure before the first HTTP request would otherwise vanish).
      */
@@ -2709,6 +2770,39 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
         }
         prevPerfEvent = null;
         return failed;
+    }
+
+    /**
+     * The KO message for this scenario's failure, or null if it has not failed: file:line + step
+     * text + the reason's first line, so it names both <em>where</em> and <em>why</em>, matching
+     * the failure log. Deliberately not the full match diff: Gatling groups its errors table by
+     * this string.
+     */
+    private String perfFailureMessage() {
+        if (!result.isFailed()) {
+            return null;
+        }
+        String display = result.getPerfFailureMessage();
+        return display != null ? display : "scenario failed";
+    }
+
+    /**
+     * Drain the held perf event, marking it KO with {@code failureMessage} if non-null. If the
+     * scenario failed but no perf event carried the failure — it failed before its first
+     * request, or via a non-HTTP step — synthesize one so the failure still surfaces as a
+     * Gatling KO instead of vanishing. Top-level only: a called feature's failure propagates to
+     * its caller, which reports it — unless an event in the called feature already carried it
+     * (avoids double KOs).
+     */
+    private void reportPerfFailure(String failureMessage) {
+        if (logLastPerfEvent(failureMessage)) {
+            result.setPerfFailureReported(true);
+        }
+        if (failureMessage != null && !result.isPerfFailureReported()
+                && isPerfMode() && featureRuntime != null && featureRuntime.isTopLevel()) {
+            reportSyntheticFailurePerfEvent(failureMessage);
+            result.setPerfFailureReported(true);
+        }
     }
 
     /**
@@ -2739,7 +2833,8 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
     /**
      * Capture a custom performance event (for non-HTTP operations like DB, gRPC).
      * <p>
-     * Unlike HTTP events, custom events are reported immediately.
+     * Held exactly like an HTTP event (see {@link #capturePerfEvent(PerfEvent)}), so a failure
+     * after it — e.g. in the operation it timed — marks it KO.
      *
      * @param name      the event name
      * @param startTime start time in epoch milliseconds
@@ -2749,11 +2844,7 @@ public class ScenarioRuntime implements Callable<ScenarioResult>, KarateJsContex
         if (!isPerfMode()) {
             return;
         }
-        PerfEvent event = new PerfEvent(startTime, endTime, name, 200);
-        PerfHook hook = getPerfHook();
-        if (hook != null) {
-            hook.reportPerfEvent(event);
-        }
+        capturePerfEvent(new PerfEvent(startTime, endTime, name, 200));
     }
 
 }

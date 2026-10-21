@@ -360,12 +360,14 @@ public class StepExecutor {
         validateVariableName(name);
         String expr = text.substring(eqIndex + 1).trim();
         String docString = step.getDocString();
+        boolean rhsIsDocString = false;
 
         // Handle docstring if expression is empty (docstring IS the RHS expression).
         // Null it afterwards so it isn't ALSO treated as a separate call argument below.
         if (expr.isEmpty() && docString != null) {
             expr = docString;
             docString = null;
+            rhsIsDocString = true;
         }
 
         // Check if RHS is a special karate expression (not standard JS)
@@ -382,7 +384,7 @@ public class StepExecutor {
             // - <xml> literals
             // - varname/xpath (XML XPath shorthand)
             // - Regular JS expressions
-            Object value = evalKarateExpression(expr);
+            Object value = evalKarateExpression(expr, rhsIsDocString ? step : null);
             runtime.setVariable(name, value);
         }
     }
@@ -611,10 +613,17 @@ public class StepExecutor {
             // caller/config scope it inherited to read. See calleeResult.
             runtime.setVariable(resultVar, calleeResult(calleeRuntime));
         } else {
-            // Shared scope - propagate all variables back to caller
-            Map<String, Object> resultVars = calleeRuntime.getAllVariables();
-            for (Map.Entry<String, Object> entry : resultVars.entrySet()) {
-                runtime.setVariable(entry.getKey(), entry.getValue());
+            // Shared scope - propagate all variables back to caller. Only the callee's own
+            // contribution is claimed (setVariable): re-binding what it merely inherited must
+            // stay out of assignedVariables, or an enclosing isolated call's delta reports the
+            // caller's scope (Outline example-row columns) as its own.
+            Map<String, Object> delta = calleeResult(calleeRuntime);
+            for (Map.Entry<String, Object> entry : calleeRuntime.getAllVariables().entrySet()) {
+                if (delta.containsKey(entry.getKey())) {
+                    runtime.setVariable(entry.getKey(), entry.getValue());
+                } else {
+                    runtime.putUnclaimedVariable(entry.getKey(), entry.getValue());
+                }
             }
             // V1 compatibility: Also propagate config changes back to caller.
             // The caller's HTTP client also needs to be re-projected so a callee-set
@@ -1831,6 +1840,15 @@ public class StepExecutor {
      * - Regular JS expressions with embedded expression processing
      */
     Object evalKarateExpression(String expr) {
+        return evalKarateExpression(expr, null);
+    }
+
+    /**
+     * @param docStringStep the step whose docstring {@code expr} is, or null. Used only when the
+     *                      expression is evaluated as JS, so its statements carry the feature file
+     *                      and line (see {@link ScenarioRuntime#evalDocString}).
+     */
+    Object evalKarateExpression(String expr, Step docStringStep) {
         if (expr == null || expr.isEmpty()) {
             return null;
         }
@@ -1895,7 +1913,11 @@ public class StepExecutor {
         // leniently (defer, don't fail-fast) so an unresolved placeholder carried inside
         // the result (e.g. a Scenario-Outline example value '#(var)' echoed back through a
         // called feature's returned variables) is left intact instead of crashing the step.
-        Object value = runtime.eval(wrapJsonLikeExpression(expr));
+        // IDE integration contract (debugger): JS from a def docstring is evaluated with the feature
+        // as its source, so a breakpoint inside the docstring (e.g. in a function body) can stop.
+        Object value = docStringStep == null
+                ? runtime.eval(wrapJsonLikeExpression(expr))
+                : runtime.evalDocString(wrapJsonLikeExpression(expr), docStringStep);
         if (value instanceof Map || value instanceof List) {
             // A JSON literal the user deliberately wrapped in round brackets is the documented
             // escape hatch for building a re-usable schema: the brackets exist precisely to keep

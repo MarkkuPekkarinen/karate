@@ -61,6 +61,9 @@ public class ScenarioResult implements Comparable<ScenarioResult> {
     // 0 = unassigned (no suite)
     private int executionIndex;
 
+    // this scenario's failure was reported KO on one of its perf events
+    private boolean perfFailureReported;
+
     public ScenarioResult(Scenario scenario) {
         this.scenario = scenario;
     }
@@ -406,6 +409,16 @@ public class ScenarioResult implements Comparable<ScenarioResult> {
                 .filter(line -> !line.isEmpty())
                 .findFirst()
                 .orElse(null);
+        // a failure raised through JS evaluation opens with the engine's "js failed:" frame header;
+        // the frame's "Error:" line is the one that says why
+        if ("js failed:".equals(firstLine)) {
+            firstLine = reason.lines()
+                    .map(String::trim)
+                    .filter(line -> line.startsWith("Error: "))
+                    .findFirst()
+                    .map(line -> line.substring("Error: ".length()).trim())
+                    .orElse(firstLine);
+        }
         if (firstLine == null) {
             return null;
         }
@@ -432,6 +445,35 @@ public class ScenarioResult implements Comparable<ScenarioResult> {
             return reason;
         }
         return reason == null ? display : display + " - " + reason;
+    }
+
+    public void setPerfFailureReported(boolean perfFailureReported) {
+        this.perfFailureReported = perfFailureReported;
+    }
+
+    /**
+     * True when the failure already reached the performance tool as a KO — on a perf event of
+     * this scenario, or of a feature called by the failing step (where a call failure
+     * originates). A synthetic KO for the same failure would count it twice.
+     */
+    public boolean isPerfFailureReported() {
+        if (perfFailureReported) {
+            return true;
+        }
+        StepResult failedStep = firstFailedStep();
+        if (failedStep == null || !failedStep.hasCallResults()) {
+            return false;
+        }
+        for (FeatureResult called : failedStep.getCallResults()) {
+            for (ScenarioResult sr : called.getScenarioResults()) {
+                if (sr.isFailed() && sr.isPerfFailureReported()) {
+                    // latched: call results may be released before an outer caller asks
+                    perfFailureReported = true;
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     public Throwable getError() {

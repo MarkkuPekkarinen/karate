@@ -166,4 +166,97 @@ class KarateExecutorTest {
         assertTrue(ko.endsWith("- match failed: EQUALS"), "KO should carry the reason: " + ko);
         assertFalse(ko.contains("\n"), "KO message must stay a single line: " + ko);
     }
+
+    private static List<String[]> runCapturing(String featurePath) {
+        List<String[]> events = new ArrayList<>();
+        GatlingStatsReporter reporter =
+                (scenario, groups, requestName, startTime, endTime, ok, statusCode, errorMessage) ->
+                        events.add(new String[]{requestName, ok ? "OK" : "KO", errorMessage});
+        new KarateExecutor(featurePath, null, null, false)
+                .execute(new HashMap<>(), new HashMap<>(), reporter, "test", NO_GROUPS);
+        return events;
+    }
+
+    private static List<String> describe(List<String[]> events) {
+        return events.stream().map(e -> e[0] + " " + e[1]).toList();
+    }
+
+    /**
+     * A custom event is held like an HTTP event, so a failure after it (here a failing
+     * {@code karate.call} the event timed, invoked from a JS function) marks it KO. The called
+     * feature must not emit its own feature-named KO.
+     */
+    @Test
+    void customEventWrappingFailingJsCallIsReportedAsKo() {
+        List<String[]> events = runCapturing("classpath:features/perf-custom-js-call-fail.feature");
+        assertEquals(List.of("my-event KO"), describe(events));
+        assertTrue(events.get(0)[2].contains("called feature failed: features/perf-sub-fail.feature - match failed"),
+                "KO should carry the failure detail: " + events.get(0)[2]);
+    }
+
+    @Test
+    void customEventBeforeFailingCallStepIsReportedAsKo() {
+        List<String[]> events = runCapturing("classpath:features/perf-custom-call-step-fail.feature");
+        assertEquals(List.of("my-event KO"), describe(events));
+        assertTrue(events.get(0)[2].contains("called feature failed: features/perf-sub-fail.feature - match failed"),
+                "KO should carry the failure detail: " + events.get(0)[2]);
+    }
+
+    @Test
+    void customEventInPassingScenarioIsReportedAsOk() {
+        List<String[]> events = runCapturing("classpath:features/perf-custom-pass.feature");
+        assertEquals(List.of("my-event OK"), describe(events));
+    }
+
+    @Test
+    void customEventFollowedByFailingHttpAssertionLeavesKoOnTheRequest() {
+        CatsMockServer.start();
+        List<String[]> events = runCapturing("classpath:features/perf-custom-then-http-fail.feature");
+        assertEquals(List.of("my-event OK", "POST /cats KO"), describe(events));
+    }
+
+    @Test
+    void customEventInFailingAfterScenarioHookIsReportedAsKo() {
+        List<String[]> events = runCapturing("classpath:features/perf-hook-fail.feature");
+        assertEquals(List.of("cleanup KO"), describe(events));
+        assertTrue(events.get(0)[2].contains("hook failed"), "KO should carry the hook failure: " + events.get(0)[2]);
+    }
+
+    @Test
+    void customEventInPassingAfterScenarioHookIsReportedAsOk() {
+        List<String[]> events = runCapturing("classpath:features/perf-hook-pass.feature");
+        assertEquals(List.of("cleanup OK"), describe(events));
+    }
+
+    @Test
+    void failingAfterScenarioHookWithoutEventIsReportedAsSyntheticKo() {
+        List<String[]> events = runCapturing("classpath:features/perf-hook-fail-no-event.feature");
+        assertEquals(List.of("features/perf-hook-fail-no-event.feature KO"), describe(events));
+        assertTrue(events.get(0)[2].contains("hook failed"), "KO should carry the hook failure: " + events.get(0)[2]);
+    }
+
+    /** The callee's event already carries the failure, so the caller must not add a synthetic KO. */
+    @Test
+    void calledFeatureCustomEventCarriesTheFailureOnce() {
+        List<String[]> events = runCapturing("classpath:features/perf-call-child-event-fail.feature");
+        assertEquals(List.of("child-event KO"), describe(events));
+    }
+
+    /**
+     * Two levels of call: only the leaf captures an event and fails. Call results are not
+     * retained (the default), so the middle's result tree is released before the root asks
+     * whether the failure was already reported - the root must still not add its own KO.
+     */
+    @Test
+    void nestedCalledFeatureCustomEventCarriesTheFailureOnce() {
+        List<String[]> events = runCapturing("classpath:features/perf-call-chain-root.feature");
+        assertEquals(List.of("leaf-event KO"), describe(events));
+    }
+
+    @Test
+    void calledFeatureHttpEventCarriesTheFailureOnce() {
+        CatsMockServer.start();
+        List<String[]> events = runCapturing("classpath:features/perf-call-child-http-fail.feature");
+        assertEquals(List.of("POST /cats KO"), describe(events));
+    }
 }

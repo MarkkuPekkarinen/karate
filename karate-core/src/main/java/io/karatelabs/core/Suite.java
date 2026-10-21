@@ -971,13 +971,53 @@ public class Suite {
         }
     }
 
+    /**
+     * A feature-level {@code @ignore} yields to the same bypasses {@link FeatureRuntime#shouldSelect}
+     * applies per scenario. The {@link #scenarioName} filter is suite-wide, so it only rescues a
+     * feature that has a scenario of that name — otherwise every {@code @ignore} helper would show
+     * up as an empty result.
+     */
     private boolean isFeatureIgnored(Feature feature) {
-        for (Tag tag : feature.getTags()) {
-            if (Tag.IGNORE.equals(tag.getName())) {
-                return true;
+        if (!skipTagFiltering && !hasLineFilter(feature)
+                && (scenarioName == null || !hasScenarioNamed(feature, scenarioName))) {
+            for (Tag tag : feature.getTags()) {
+                if (Tag.IGNORE.equals(tag.getName())) {
+                    return true;
+                }
             }
         }
         return allSectionsExcluded(feature);
+    }
+
+    private boolean hasLineFilter(Feature feature) {
+        if (lineFilters.isEmpty()) {
+            return false;
+        }
+        Set<Integer> lines = lineFilters.get(feature.getResource().getUri().toString());
+        return lines != null && !lines.isEmpty();
+    }
+
+    private static boolean hasScenarioNamed(Feature feature, String name) {
+        List<FeatureSection> sections = feature.getSections();
+        if (sections == null) {
+            return false;
+        }
+        for (FeatureSection section : sections) {
+            if (section.isOutline()) {
+                String outlineName = section.getScenarioOutline().getName();
+                // rows substitute example values into the name, so a placeholder may match at run time
+                if (outlineName != null && (outlineName.contains("<") || outlineName.contains("${")
+                        || outlineName.trim().equals(name))) {
+                    return true;
+                }
+            } else {
+                String sectionName = section.getScenario().getName();
+                if (sectionName != null && sectionName.trim().equals(name)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**
@@ -1005,18 +1045,8 @@ public class Suite {
         if (tagSelector == null) {
             return false;
         }
-        if (skipTagFiltering) {
+        if (skipTagFiltering || scenarioName != null || hasLineFilter(feature)) {
             return false;
-        }
-        if (scenarioName != null) {
-            return false;
-        }
-        if (!lineFilters.isEmpty()) {
-            String featureUri = feature.getResource().getUri().toString();
-            Set<Integer> lines = lineFilters.get(featureUri);
-            if (lines != null && !lines.isEmpty()) {
-                return false;
-            }
         }
         List<FeatureSection> sections = feature.getSections();
         if (sections == null || sections.isEmpty()) {
@@ -1104,6 +1134,20 @@ public class Suite {
 
     void cleanupThreadListeners() {
         threadListeners.remove();
+    }
+
+    /**
+     * Per-thread listeners for a thread that may already have them: a parallel scenario runs on
+     * its own scenario-executor thread, which needs its own, but must not replace (or later remove)
+     * those of a thread that already has some, e.g. an executor that runs the task inline.
+     * Returns true when this call created them, so the caller cleans up only what it set.
+     */
+    boolean initThreadListenersIfAbsent() {
+        if (listenerFactories.isEmpty() || threadListeners.get() != null) {
+            return false;
+        }
+        initThreadListeners();
+        return true;
     }
 
     public boolean fireEvent(RunEvent event) {
